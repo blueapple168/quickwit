@@ -1,20 +1,57 @@
 name: Build Quickwit UOS Container Image
-run-name: Build Quickwit UOS image ${{ inputs.version || github.ref_name }}
+run-name: Build Quickwit UOS image ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+
+# =============================================================================
+# 在 GitHub Actions 上构建 Quickwit 的 UOS Server 20-1070a 镜像
+# （GNU Rust 工具链，全在线依赖）
+#
+# 仓库布局（约定）：
+#   仓库根目录的 Dockerfile 即 GNU 版构建文件（本地暂存名 Dockerfile.gnu）
+#   源码位于 quickwit/**
+#   配置位于 config/quickwit.yaml
+#
+# 依赖的在线源（构建机需可直连）：
+#   - ghcr.io / registry.uniontech.com   基础镜像 UOS Server 20-1070a
+#   - github.com/openssl/openssl         OpenSSL 3.5.9 源码
+#   - github.com/Yelp/dumb-init          dumb-init 1.2.5
+#   - github.com/protocolbuffers/protobuf protoc 25.6 预编译包
+#   - static.rust-lang.org               Rust 1.98.0 x86_64-unknown-linux-gnu
+#   - nodejs.org                         Node v24.21.0
+#
+# 说明：UOS 基础镜像若在私有 registry，需在下方 "Login to UOS registry"
+#       步骤里取消注释并配置 Secrets（UOS_REGISTRY_USER / UOS_REGISTRY_TOKEN）。
+# =============================================================================
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Container image tag (e.g v0.10.1-nightly)"
+        description: "Quickwit 主版本号作为镜像 tag（如 v0.9.1）。留空则自动提取并去掉 -nightly 后缀"
         required: false
         type: string
+      push_image:
+        description: "是否推送镜像到 GHCR"
+        type: boolean
+        default: true
   push:
     branches:
       - main
+    paths:
+      - "Dockerfile"
+      - "quickwit/**"
+      - "config/**"
+      - ".github/workflows/build-quickwit-uos-container.yml"
 
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: blueapple168/quickwit
+  OPENSSL_VERSION: "3.5.9"
+  RUST_VERSION: "1.98.0"
+  RUST_HOST: "x86_64-unknown-linux-gnu"
+  NODE_VERSION: "v24.21.0"
+  DUMB_INIT_VERSION: "1.2.5"
+  PROTOC_VERSION: "25.6"
+  TARGETPLATFORM: "linux/amd64"
 
 jobs:
   build-and-push:
@@ -37,39 +74,82 @@ jobs:
           echo "QW_COMMIT_TAGS=$(git tag --points-at HEAD | tr '\n' ',')" >> $GITHUB_OUTPUT
         shell: bash
 
-      - name: Set image tag
+      # ---------------------------------------------------------------------
+      # 镜像 tag：只保留一个，以 quickwit 程序主版本为准
+      #   优先级：手工输入 version > git tag > Cargo.toml 的 package.version
+      #   归一化：去掉 -nightly / -alpha 等预发布后缀，得到纯主版本号
+      # ---------------------------------------------------------------------
+      - name: Resolve quickwit main version tag
         id: set_tag
         run: |
+          set -euo pipefail
+
           if [[ -n "${{ inputs.version }}" ]]; then
-            IMG_TAG="${{ inputs.version }}"
+            RAW="${{ inputs.version }}"
+            SRC="手工输入"
           elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            IMG_TAG="${GITHUB_REF#refs/tags/}"
+            RAW="${GITHUB_REF#refs/tags/}"
+            SRC="git tag"
           else
-            IMG_TAG="${{ github.sha }}"
+            RAW="$(sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' quickwit/Cargo.toml | head -n1)"
+            SRC="Cargo.toml"
           fi
+
+          # 去掉预发布后缀：0.9.1-nightly -> 0.9.1
+          IMG_TAG="${RAW%%-*}"
+          # 归一化 v 前缀：保证表现为 v0.9.1
+          IMG_TAG="v${IMG_TAG#v}"
+
           echo "IMG_TAG=${IMG_TAG}" >> $GITHUB_OUTPUT
+          echo "版本来源：${SRC}（原始值 ${RAW}）→ 镜像 tag：${IMG_TAG}"
         shell: bash
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # UOS 私有 registry 登录（需要时取消注释并配 Secrets）
+      # - name: Login to UOS registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: registry.uniontech.com
+      #     username: ${{ secrets.UOS_REGISTRY_USER }}
+      #     password: ${{ secrets.UOS_REGISTRY_TOKEN }}
+
       - name: Login to GHCR
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build & Push Quickwit UOS‑1070a image
+      - name: Build & Push Quickwit UOS-1070a image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
-          push: true
+          platforms: ${{ env.TARGETPLATFORM }}
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
           tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.set_tag.outputs.IMG_TAG }}
           build-args: |
             BASE_IMAGE_TAG=uos-server-20-1070a:latest
+            TARGETPLATFORM=${{ env.TARGETPLATFORM }}
+            OPENSSL_VERSION=${{ env.OPENSSL_VERSION }}
+            RUST_VERSION=${{ env.RUST_VERSION }}
+            RUST_HOST=${{ env.RUST_HOST }}
+            NODE_VERSION=${{ env.NODE_VERSION }}
+            DUMB_INIT_VERSION=${{ env.DUMB_INIT_VERSION }}
+            PROTOC_VERSION=${{ env.PROTOC_VERSION }}
             QW_COMMIT_DATE=${{ steps.git_meta.outputs.QW_COMMIT_DATE }}
             QW_COMMIT_HASH=${{ steps.git_meta.outputs.QW_COMMIT_HASH }}
             QW_COMMIT_TAGS=${{ steps.git_meta.outputs.QW_COMMIT_TAGS }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
