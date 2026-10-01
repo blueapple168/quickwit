@@ -1,0 +1,75 @@
+name: Build Quickwit UOS Container Image
+run-name: Build Quickwit UOS image ${{ inputs.version || github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Container image tag (e.g v0.10.1-nightly)"
+        required: false
+        type: string
+  push:
+    branches:
+      - main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: blueapple168/quickwit
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Retrieve git commit metadata for docker build args
+        id: git_meta
+        run: |
+          echo "QW_COMMIT_DATE=$(TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
+          echo "QW_COMMIT_HASH=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "QW_COMMIT_TAGS=$(git tag --points-at HEAD | tr '\n' ',')" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set image tag
+        id: set_tag
+        run: |
+          if [[ -n "${{ inputs.version }}" ]]; then
+            IMG_TAG="${{ inputs.version }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            IMG_TAG="${GITHUB_REF#refs/tags/}"
+          else
+            IMG_TAG="${{ github.sha }}"
+          fi
+          echo "IMG_TAG=${IMG_TAG}" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & Push Quickwit UOS‑1070a image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.set_tag.outputs.IMG_TAG }}
+          build-args: |
+            BASE_IMAGE_TAG=uos-server-20-1070a:latest
+            QW_COMMIT_DATE=${{ steps.git_meta.outputs.QW_COMMIT_DATE }}
+            QW_COMMIT_HASH=${{ steps.git_meta.outputs.QW_COMMIT_HASH }}
+            QW_COMMIT_TAGS=${{ steps.git_meta.outputs.QW_COMMIT_TAGS }}
