@@ -4,7 +4,7 @@ FROM ${UOS_BASE} AS builder
 
 LABEL maintainer="blueapple" \
       version="1.0" \
-      description="Dotnet runtime-deps on UOS 1070a" \
+      description="Rust runtime-deps on UOS 1070a" \
       org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest"
 
 
