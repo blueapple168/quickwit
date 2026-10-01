@@ -1,21 +1,13 @@
 # syntax=docker/dockerfile:1
 # =============================================================================
 # Quickwit on UOS Server 20-1070a —— 全在线构建版 / GNU 工具链（GitHub Actions）
-#
-# 设计前提：
-#   1) 构建在 GitHub Actions 上跑（能直连 github.com / nodejs.org / static.rust-lang.org）
-#   2) 所有依赖在线安装，不需要离线包 COPY
-#   3) 基础镜像 UOS Server 20-1070a（glibc 发行版）
-#
-# Rust 选型：x86_64-unknown-linux-gnu host 工具链（本次改为 gnu）
-#   —— gnu 工具链的 rustc/cargo 直接链接系统 glibc，
-#      PT_INTERP = /lib64/ld-linux-x86-64.so.2（UOS 自带），DT_NEEDED 全部由系统提供。
-#      不需要额外补 musl loader，不需要 Alpine apk，产物 ABI 与 UOS 系统库一致。
-#      这是相比 musl 版最省事、最不容易翻车的选择。
 # =============================================================================
 
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 ARG UOS_BASE=ghcr.io/blueapple168/${BASE_IMAGE_TAG}
+# 目标平台：UOS 基础镜像只提供 amd64。
+# 做成 ARG 可覆盖，同时消除 FROM --platform 常量告警（FromPlatformFlagConstDisallowed）。
+ARG TARGETPLATFORM=linux/amd64
 
 # 全局构建参数（可被 GitHub Actions 覆盖）
 ARG OPENSSL_VERSION=3.5.9
@@ -23,12 +15,15 @@ ARG RUST_VERSION=1.98.0
 ARG RUST_HOST=x86_64-unknown-linux-gnu
 ARG NODE_VERSION=v24.21.0
 ARG DUMB_INIT_VERSION=1.2.5
+# protoc 版本：必须 >= 3.12 才支持 --experimental_allow_proto3_optional，
+# UOS 仓库自带的 protobuf-compiler（~3.5）太老会直接报 Unknown flag。
+ARG PROTOC_VERSION=25.6
 
 
 # =============================================================================
 # stage0  openssl-builder —— 编译 OpenSSL ${OPENSSL_VERSION} (LTS)
 # =============================================================================
-FROM --platform=linux/amd64 ${UOS_BASE} AS openssl-builder
+FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS openssl-builder
 ARG OPENSSL_VERSION
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
@@ -55,7 +50,7 @@ RUN cd /tmp; \
 # =============================================================================
 # stage1  ui-builder —— 编译前端 UI（在线装 Node）
 # =============================================================================
-FROM --platform=linux/amd64 ${UOS_BASE} AS ui-builder
+FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS ui-builder
 ARG NODE_VERSION
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
@@ -91,10 +86,11 @@ RUN touch .gitignore_for_build_directory; \
 # =============================================================================
 # stage2  bin-builder —— Rust 编译 Quickwit，链接自建 OpenSSL
 # =============================================================================
-FROM --platform=linux/amd64 ${UOS_BASE} AS bin-builder
+FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS bin-builder
 ARG RUST_VERSION
 ARG RUST_HOST
 ARG DUMB_INIT_VERSION
+ARG PROTOC_VERSION
 ARG CARGO_FEATURES=release-feature-set
 ARG CARGO_PROFILE=release
 ARG QW_COMMIT_DATE
@@ -106,15 +102,31 @@ ENV QW_COMMIT_DATE=${QW_COMMIT_DATE} \
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 # ---- 系统编译依赖 + dumb-init（全部在线） ----
+# 注意：这里故意不装 UOS 的 protobuf-compiler（版本 ~3.5，不认
+#       --experimental_allow_proto3_optional），protoc 单独用官方预编译包装。
 RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        tar gzip xz curl ca-certificates findutils \
-        clang cmake llvm protobuf-compiler \
+        tar gzip xz unzip curl ca-certificates findutils \
+        clang cmake llvm \
         gcc gcc-c++ make pkgconfig perl; \
     yum clean all; rm -rf /var/cache/yum/*; \
     curl -fsSL "https://github.com/Yelp/dumb-init/releases/download/v${DUMB_INIT_VERSION}/dumb-init_${DUMB_INIT_VERSION}_x86_64" \
          -o /usr/local/bin/dumb-init; \
     chmod +x /usr/local/bin/dumb-init
+
+# ---- protoc（官方预编译包，替换 UOS 的老版本） ----
+# 背景：Quickwit 的 quickwit-proto/build.rs 通过 prost-build 调 protoc 时传了
+#       --experimental_allow_proto3_optional，该 flag 需要 protoc >= 3.12。
+#       UOS 1070a 仓库里的 protobuf-compiler 约 3.5，会报 "Unknown flag" 直接 panic。
+#       官方 zip 内为 bin/protoc + include/google/protobuf/*（well-known types 齐全）。
+RUN curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip" \
+         -o /tmp/protoc.zip; \
+    unzip -q /tmp/protoc.zip -d /usr/local; \
+    chmod 755 /usr/local/bin/protoc; \
+    rm -f /tmp/protoc.zip; \
+    /usr/local/bin/protoc --version
+# prost-build 优先读 PROTOC 环境变量，显式指过去最稳
+ENV PROTOC=/usr/local/bin/protoc
 
 # ---- OpenSSL 编译产物 ----
 COPY --from=openssl-builder /usr/local/openssl3 /usr/local/openssl3
@@ -167,7 +179,7 @@ RUN --mount=type=cache,target=/quickwit/target,sharing=locked \
 # =============================================================================
 # stage3  最终运行镜像（UOS）
 # =============================================================================
-FROM --platform=linux/amd64 ${UOS_BASE} AS quickwit
+FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS quickwit
 ARG BASE_IMAGE_TAG
 LABEL org.opencontainers.image.authors="blueapple" \
       org.opencontainers.image.version="1.0" \
