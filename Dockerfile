@@ -1,137 +1,191 @@
+# syntax=docker/dockerfile:1
+# =============================================================================
+# Quickwit on UOS Server 20-1070a —— 全在线构建版 / GNU 工具链（GitHub Actions）
+#
+# 设计前提：
+#   1) 构建在 GitHub Actions 上跑（能直连 github.com / nodejs.org / static.rust-lang.org）
+#   2) 所有依赖在线安装，不需要离线包 COPY
+#   3) 基础镜像 UOS Server 20-1070a（glibc 发行版）
+#
+# Rust 选型：x86_64-unknown-linux-gnu host 工具链（本次改为 gnu）
+#   —— gnu 工具链的 rustc/cargo 直接链接系统 glibc，
+#      PT_INTERP = /lib64/ld-linux-x86-64.so.2（UOS 自带），DT_NEEDED 全部由系统提供。
+#      不需要额外补 musl loader，不需要 Alpine apk，产物 ABI 与 UOS 系统库一致。
+#      这是相比 musl 版最省事、最不容易翻车的选择。
+# =============================================================================
+
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 ARG UOS_BASE=ghcr.io/blueapple168/${BASE_IMAGE_TAG}
-FROM ${UOS_BASE} AS builder
 
-LABEL maintainer="blueapple" \
-      version="1.0" \
-      description="Rust runtime-deps on UOS 1070a" \
-      org.opencontainers.image.base.name="registry.uniontech.com/uos-server-base/uos-server-20-1070a:latest"
+# 全局构建参数（可被 GitHub Actions 覆盖）
+ARG OPENSSL_VERSION=3.5.9
+ARG RUST_VERSION=1.98.0
+ARG RUST_HOST=x86_64-unknown-linux-gnu
+ARG NODE_VERSION=v24.21.0
+ARG DUMB_INIT_VERSION=1.2.5
 
 
-# ------------------------------
-# stage0 openssl‑builder 编译 openssl‑${OPENSSL_VERSION:-3.5.9}(LTS)
-# ------------------------------
+# =============================================================================
+# stage0  openssl-builder —— 编译 OpenSSL ${OPENSSL_VERSION} (LTS)
+# =============================================================================
 FROM --platform=linux/amd64 ${UOS_BASE} AS openssl-builder
-RUN set -eux; \
-    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
-    yum install -y tar gzip gcc make perl diffutils cmake
+ARG OPENSSL_VERSION
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-ENV OPENSSL_VERSION=3.5.9
-RUN set -eux; \
-    cd /tmp; \
-    curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz -o openssl-${OPENSSL_VERSION}.tar.gz; \
-    curl -fsSL https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz.sha256 -o openssl-${OPENSSL_VERSION}.tar.gz.sha256; \
-    sha256sum -c openssl-${OPENSSL_VERSION}.tar.gz.sha256; \
-    tar -zxf openssl-${OPENSSL_VERSION}.tar.gz; \
-    cd openssl-${OPENSSL_VERSION}; \
+RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        tar gzip curl ca-certificates findutils gcc make perl diffutils; \
+    yum clean all; rm -rf /var/cache/yum/*
+
+RUN cd /tmp; \
+    curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+         -o "openssl-${OPENSSL_VERSION}.tar.gz"; \
+    curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz.sha256" \
+         -o "openssl-${OPENSSL_VERSION}.tar.gz.sha256"; \
+    sha256sum -c "openssl-${OPENSSL_VERSION}.tar.gz.sha256"; \
+    tar -zxf "openssl-${OPENSSL_VERSION}.tar.gz"; \
+    cd "openssl-${OPENSSL_VERSION}"; \
     ./config --prefix=/usr/local/openssl3 --openssldir=/usr/local/openssl3 shared; \
-    make -j$(nproc); \
-    make install; \
+    make -j"$(nproc)"; \
+    make install_sw install_ssldirs; \
     cd /; \
-    rm -rf /tmp/openssl-${OPENSSL_VERSION} /tmp/openssl-${OPENSSL_VERSION}.tar.gz /tmp/openssl-${OPENSSL_VERSION}.tar.gz.sha256
+    rm -rf /tmp/openssl-${OPENSSL_VERSION} /tmp/openssl-${OPENSSL_VERSION}.tar.gz*
 
-# ------------------------------
-# stage1 ui‑builder：编译前端UI，离线node
-# ------------------------------
+
+# =============================================================================
+# stage1  ui-builder —— 编译前端 UI（在线装 Node）
+# =============================================================================
 FROM --platform=linux/amd64 ${UOS_BASE} AS ui-builder
-RUN set -eux; \
-    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
-    yum install -y tar gzip make
-ENV NODE_VERSION=v24.21.0
-RUN set -eux; \
-    cd /opt ; \
-    curl -fsSL https://nodejs.org/download/release/latest-v24.x/node-${NODE_VERSION}-linux-x64.tar.gz -o node-${NODE_VERSION}-linux-x64.tar.gz ; \
-    curl -fsSL https://nodejs.org/download/release/latest-v24.x/SHASUMS256.txt | grep "node-${NODE_VERSION}-linux-x64.tar.gz" | sha256sum -c ; \
-    tar -xzf node-${NODE_VERSION}-linux-x64.tar.gz; \
-    mv node-${NODE_VERSION}-linux-x64 nodejs
+ARG NODE_VERSION
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
+
+RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        tar gzip xz curl ca-certificates findutils make gcc gcc-c++ python3; \
+    yum clean all; rm -rf /var/cache/yum/*
+
+RUN cd /opt; \
+    curl -fsSL "https://nodejs.org/download/release/latest-v24.x/node-${NODE_VERSION}-linux-x64.tar.gz" \
+         -o "node-${NODE_VERSION}-linux-x64.tar.gz"; \
+    curl -fsSL "https://nodejs.org/download/release/latest-v24.x/SHASUMS256.txt" \
+       | grep "node-${NODE_VERSION}-linux-x64.tar.gz" \
+       | sha256sum -c -; \
+    tar -xzf "node-${NODE_VERSION}-linux-x64.tar.gz"; \
+    mv "node-${NODE_VERSION}-linux-x64" nodejs; \
+    rm -f "node-${NODE_VERSION}-linux-x64.tar.gz"
 
 ENV PATH="/opt/nodejs/bin:${PATH}"
 
-# 新增：利用npm全局安装yarn和node‑gyp
-RUN set -eux; npm install -g yarn node-gyp
+# yarn / node-gyp 走在线源
+RUN npm config set registry https://registry.npmmirror.com; \
+    npm install -g yarn node-gyp; \
+    node --version; npm --version; yarn --version
+
 COPY quickwit/quickwit-ui /quickwit/quickwit-ui
 WORKDIR /quickwit/quickwit-ui
-RUN touch .gitignore_for_build_directory ; \
-    NODE_ENV=production make install build ; \
-    rm -rf /opt/node-${NODE_VERSION}-linux-x64.tar.gz /tmp/*
+RUN touch .gitignore_for_build_directory; \
+    NODE_ENV=production make install build; \
+    rm -rf /tmp/*
 
 
-# ------------------------------
-# stage2 bin‑builder：rust编译后端quickwit；链接自建openssl3.5.9
-# ------------------------------
+# =============================================================================
+# stage2  bin-builder —— Rust 编译 Quickwit，链接自建 OpenSSL
+# =============================================================================
 FROM --platform=linux/amd64 ${UOS_BASE} AS bin-builder
+ARG RUST_VERSION
+ARG RUST_HOST
+ARG DUMB_INIT_VERSION
 ARG CARGO_FEATURES=release-feature-set
 ARG CARGO_PROFILE=release
 ARG QW_COMMIT_DATE
 ARG QW_COMMIT_HASH
 ARG QW_COMMIT_TAGS
-ENV QW_COMMIT_DATE=$QW_COMMIT_DATE
-ENV QW_COMMIT_HASH=$QW_COMMIT_HASH
-ENV QW_COMMIT_TAGS=$QW_COMMIT_TAGS
+ENV QW_COMMIT_DATE=${QW_COMMIT_DATE} \
+    QW_COMMIT_HASH=${QW_COMMIT_HASH} \
+    QW_COMMIT_TAGS=${QW_COMMIT_TAGS}
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-# 安装系统编译依赖
-RUN set -eux; \
-    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
-    yum install -y tar findutils gzip clang cmake llvm protobuf-compiler ca-certificates; \
-    curl -fsSL https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64 -o /usr/local/bin/dumb-init ; \
+# ---- 系统编译依赖 + dumb-init（全部在线） ----
+RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        tar gzip xz curl ca-certificates findutils \
+        clang cmake llvm protobuf-compiler \
+        gcc gcc-c++ make pkgconfig perl; \
+    yum clean all; rm -rf /var/cache/yum/*; \
+    curl -fsSL "https://github.com/Yelp/dumb-init/releases/download/v${DUMB_INIT_VERSION}/dumb-init_${DUMB_INIT_VERSION}_x86_64" \
+         -o /usr/local/bin/dumb-init; \
     chmod +x /usr/local/bin/dumb-init
 
-# copy openssl编译产物 from openssl‑builder
+# ---- OpenSSL 编译产物 ----
 COPY --from=openssl-builder /usr/local/openssl3 /usr/local/openssl3
 
-RUN set -eux; \
-    cd /opt; \
-    curl -fsSL https://static.rust-lang.org/dist/rust-1.98.0-x86_64-unknown-linux-musl.tar.gz  -o rust-1.98.0-x86_64-unknown-linux-musl.tar.gz; \
-    tar -xzf rust-1.98.0-x86_64-unknown-linux-musl.tar.gz ; \
-    cd rust-1.98.0-x86_64-unknown-linux-musl && ./install.sh --yes --prefix=/usr/local;
-ENV PATH="/root/.cargo/bin:${PATH}"
+# ---- Rust host 工具链（在线安装，gnu 版） ----
+# 注意：tarball 里的 install.sh 是 rust-installer v3，
+#       没有 --yes / --force 这类选项，传了会 "Option '--yes' is not recognized" 直接失败。
+#       用 --disable-ldconfig 跳过它对 ld.so.conf 的写入，避免污染。
+RUN cd /opt; \
+    curl -fsSL "https://static.rust-lang.org/dist/rust-${RUST_VERSION}-${RUST_HOST}.tar.gz" \
+         -o "rust-${RUST_VERSION}-${RUST_HOST}.tar.gz"; \
+    tar -xzf "rust-${RUST_VERSION}-${RUST_HOST}.tar.gz"; \
+    cd "rust-${RUST_VERSION}-${RUST_HOST}"; \
+    ./install.sh --prefix=/usr/local --disable-ldconfig --verbose; \
+    cd /; \
+    rm -rf "/opt/rust-${RUST_VERSION}-${RUST_HOST}" "/opt/rust-${RUST_VERSION}-${RUST_HOST}.tar.gz"
 
-# 设置openssl环境变量，cargo编译时优先使用自建openssl‑3.5.9
-ENV OPENSSL_DIR=/usr/local/openssl3
-ENV OPENSSL_LIB_DIR=/usr/local/openssl3/lib64
-ENV OPENSSL_INCLUDE_DIR=/usr/local/openssl3/include
-ENV LD_LIBRARY_PATH=/usr/local/openssl3/lib64:${LD_LIBRARY_PATH}
+# tarball 装到 /usr/local/bin（不是 rustup 的 ~/.cargo/bin）
+ENV PATH="/usr/local/bin:${PATH}"
 
+# 自检：工具链能真的跑起来才算装好（gnu 版直接依赖系统 glibc，无需补 loader）
+RUN rustc --version && cargo --version && rustc -vV
+
+# ---- OpenSSL 环境变量：cargo 编译优先用自建 openssl-3.5.9 ----
+ENV OPENSSL_DIR=/usr/local/openssl3 \
+    OPENSSL_LIB_DIR=/usr/local/openssl3/lib64 \
+    OPENSSL_INCLUDE_DIR=/usr/local/openssl3/include \
+    LD_LIBRARY_PATH=/usr/local/openssl3/lib64
+
+# ---- Quickwit 源码 + UI 产物 ----
 COPY quickwit /quickwit
 COPY config/quickwit.yaml /quickwit/config/quickwit.yaml
 COPY --from=ui-builder /quickwit/quickwit-ui/build /quickwit/quickwit-ui/build
-
 WORKDIR /quickwit
 
-# RUN rustup toolchain install
-
-RUN echo "Building workspace with feature(s) '$CARGO_FEATURES' and profile '$CARGO_PROFILE'" \
-    && RUSTFLAGS="--cfg tokio_unstable" \
+# 编译（带 BuildKit 缓存，Actions 上多栈复用更快）
+RUN --mount=type=cache,target=/quickwit/target,sharing=locked \
+    set -eux; \
+    echo "Building workspace with feature(s) '${CARGO_FEATURES}' and profile '${CARGO_PROFILE}'"; \
+    export RUSTFLAGS="--cfg tokio_unstable"; \
     cargo build \
-    -p quickwit-cli \
-    --features $CARGO_FEATURES \
-    --bin quickwit \
-    $(test "$CARGO_PROFILE" = "release" && echo "--release") \
-    && echo "Copying binaries to /quickwit/bin" \
-    && mkdir -p /quickwit/bin \
-    && find target/$CARGO_PROFILE -maxdepth 1 -perm /a+x -type f -exec mv {} /quickwit/bin \;
+        -p quickwit-cli \
+        --features "${CARGO_FEATURES}" \
+        --bin quickwit \
+        $(test "${CARGO_PROFILE}" = "release" && echo "--release"); \
+    mkdir -p /quickwit/bin; \
+    find "target/${CARGO_PROFILE}" -maxdepth 1 -perm /a+x -type f -exec mv {} /quickwit/bin/ \;
 
-# ------------------------------
-# stage3 final 最终运行镜像(UOS)
-# ------------------------------
+
+# =============================================================================
+# stage3  最终运行镜像（UOS）
+# =============================================================================
 FROM --platform=linux/amd64 ${UOS_BASE} AS quickwit
-ARG UOS_BASE
-LABEL org.opencontainers.image.authors="baidongying@cnpc.com.cn" \
+ARG BASE_IMAGE_TAG
+LABEL org.opencontainers.image.authors="blueapple" \
       org.opencontainers.image.version="1.0" \
       org.opencontainers.image.licenses="Apache-2.0" \
-      org.opencontainers.image.description="Quickwit(UOS‑Server‑1070a)" \
+      org.opencontainers.image.description="Quickwit(UOS-Server-1070a)" \
       os="UOS Linux" \
       os.version="${BASE_IMAGE_TAG}"
+SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
-RUN set -eux; \
-    sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
-    yum install -y ca-certificates curl findutils; \
+RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
+    yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
+        ca-certificates curl findutils tar gzip; \
     yum clean all; \
     rm -rf /var/cache/yum/* /var/tmp/* /tmp/*
 
-# copy openssl runtime库
+# OpenSSL 运行时库
 COPY --from=openssl-builder /usr/local/openssl3 /usr/local/openssl3
-ENV LD_LIBRARY_PATH=/usr/local/openssl3/lib64:${LD_LIBRARY_PATH}
+ENV LD_LIBRARY_PATH=/usr/local/openssl3/lib64
 
 WORKDIR /quickwit
 RUN mkdir -p config qwdata
@@ -139,11 +193,14 @@ RUN mkdir -p config qwdata
 COPY --from=bin-builder /quickwit/bin/quickwit /usr/local/bin/quickwit
 COPY --from=bin-builder /quickwit/config/quickwit.yaml /quickwit/config/quickwit.yaml
 COPY --from=bin-builder /usr/local/bin/dumb-init /usr/local/bin/dumb-init
+RUN chmod 755 /usr/local/bin/dumb-init /usr/local/bin/quickwit
 
-ENV QW_CONFIG=/quickwit/config/quickwit.yaml
-ENV QW_DATA_DIR=/quickwit/qwdata
-ENV QW_LISTEN_ADDRESS=0.0.0.0
+ENV QW_CONFIG=/quickwit/config/quickwit.yaml \
+    QW_DATA_DIR=/quickwit/qwdata \
+    QW_LISTEN_ADDRESS=0.0.0.0
 
 RUN quickwit --version
+
+EXPOSE 7280 7281
 ENTRYPOINT ["/usr/local/bin/dumb-init", "--", "quickwit"]
 CMD ["run"]
