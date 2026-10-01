@@ -83,7 +83,7 @@ RUN set -eux; \
     cd /opt; \
     curl -fsSL https://static.rust-lang.org/dist/rust-1.98.0-x86_64-unknown-linux-musl.tar.gz  -o rust-1.98.0-x86_64-unknown-linux-musl.tar.gz; \
     tar -xzf rust-1.98.0-x86_64-unknown-linux-musl.tar.gz ; \
-    cd rust-1.98.0-x86_64-unknown-linux-musl && ./install.sh;
+    cd rust-1.98.0-x86_64-unknown-linux-musl && ./install.sh --yes --prefix=/usr/local;
 ENV PATH="/root/.cargo/bin:${PATH}"
 
 # 设置openssl环境变量，cargo编译时优先使用自建openssl‑3.5.9
