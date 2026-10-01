@@ -5,9 +5,11 @@
 
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 ARG UOS_BASE=ghcr.io/blueapple168/${BASE_IMAGE_TAG}
-# 目标平台：UOS 基础镜像只提供 amd64。
-# 做成 ARG 可覆盖，同时消除 FROM --platform 常量告警（FromPlatformFlagConstDisallowed）。
-ARG TARGETPLATFORM=linux/amd64
+# 目标平台：UOS 基础镜像只提供 linux/amd64。
+# 不再写 FROM --platform=$TARGETPLATFORM —— TARGETPLATFORM 是 BuildKit 预定义 ARG，
+# FROM 默认就取该平台，显式写等于重复，会触发 RedundantTargetPlatform 告警。
+# 同时也不再声明自己的 ARG TARGETPLATFORM（会遮蔽预定义值）。
+# 已知限制：本构建链只支持 amd64；将来若要出 arm64 需重做（UOS 侧无 arm64 基础镜像）。
 
 # 全局构建参数（可被 GitHub Actions 覆盖）
 ARG OPENSSL_VERSION=3.5.9
@@ -23,7 +25,7 @@ ARG PROTOC_VERSION=25.6
 # =============================================================================
 # stage0  openssl-builder —— 编译 OpenSSL ${OPENSSL_VERSION} (LTS)
 # =============================================================================
-FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS openssl-builder
+FROM ${UOS_BASE} AS openssl-builder
 ARG OPENSSL_VERSION
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
@@ -50,7 +52,7 @@ RUN cd /tmp; \
 # =============================================================================
 # stage1  ui-builder —— 编译前端 UI（在线装 Node）
 # =============================================================================
-FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS ui-builder
+FROM ${UOS_BASE} AS ui-builder
 ARG NODE_VERSION
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
@@ -86,7 +88,7 @@ RUN touch .gitignore_for_build_directory; \
 # =============================================================================
 # stage2  bin-builder —— Rust 编译 Quickwit，链接自建 OpenSSL
 # =============================================================================
-FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS bin-builder
+FROM ${UOS_BASE} AS bin-builder
 ARG RUST_VERSION
 ARG RUST_HOST
 ARG DUMB_INIT_VERSION
@@ -96,19 +98,28 @@ ARG CARGO_PROFILE=release
 ARG QW_COMMIT_DATE
 ARG QW_COMMIT_HASH
 ARG QW_COMMIT_TAGS
+ARG OPENSSL_PREFIX=/usr/local/openssl3
+ARG OPENSSL_LIBDIR=lib64
 ENV QW_COMMIT_DATE=${QW_COMMIT_DATE} \
     QW_COMMIT_HASH=${QW_COMMIT_HASH} \
     QW_COMMIT_TAGS=${QW_COMMIT_TAGS}
 SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 # ---- 系统编译依赖 + dumb-init（全部在线） ----
-# 注意：这里故意不装 UOS 的 protobuf-compiler（版本 ~3.5，不认
-#       --experimental_allow_proto3_optional），protoc 单独用官方预编译包装。
+# 注意 1：这里故意不装 UOS 的 protobuf-compiler（版本 ~3.5，不认
+#         --experimental_allow_proto3_optional），protoc 单独用官方预编译包装。
+# 注意 2：devel 包不能省。rdkafka-sys 走 vendored CMake 编 librdkafka，
+#         CMake 探测依赖需要对应的 CMake config/pkgconfig 文件：
+#           openssl-devel  -> 提供 OpenSSLConfig.cmake（供 -DCMAKE_PREFIX_PATH 命中）
+#           zlib-devel     -> zlib 的 CMake 探测（FindZLIB 兜底）
+#         以前只装 gcc-c++，靠 vendored zlib/zstd 也能过，但 openssl 没有 devel
+#         就一定找不到。
 RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        tar gzip xz unzip curl ca-certificates findutils \
+        tar gzip xz unzip curl ca-certificates findutils which \
         clang cmake llvm \
-        gcc gcc-c++ make pkgconfig perl; \
+        gcc gcc-c++ make pkgconfig perl \
+        openssl-devel zlib-devel; \
     yum clean all; rm -rf /var/cache/yum/*; \
     curl -fsSL "https://github.com/Yelp/dumb-init/releases/download/v${DUMB_INIT_VERSION}/dumb-init_${DUMB_INIT_VERSION}_x86_64" \
          -o /usr/local/bin/dumb-init; \
@@ -151,10 +162,55 @@ ENV PATH="/usr/local/bin:${PATH}"
 RUN rustc --version && cargo --version && rustc -vV
 
 # ---- OpenSSL 环境变量：cargo 编译优先用自建 openssl-3.5.9 ----
-ENV OPENSSL_DIR=/usr/local/openssl3 \
-    OPENSSL_LIB_DIR=/usr/local/openssl3/lib64 \
-    OPENSSL_INCLUDE_DIR=/usr/local/openssl3/include \
-    LD_LIBRARY_PATH=/usr/local/openssl3/lib64
+#
+# 为什么需要这么多变量（上一版只给了 OPENSSL_DIR 系列，rdkafka-sys 直接失败）：
+#
+#   1) OPENSSL_DIR / OPENSSL_LIB_DIR / OPENSSL_INCLUDE_DIR
+#      给 openssl-sys 这个 Rust crate 用（它按这套约定找自建 OpenSSL）。
+#
+#   2) OPENSSL_ROOT_DIR
+#      ---- 这次报错的根因 ----
+#      rdkafka-sys 带 vendored librdkafka，用 CMake 编译，CMake 的
+#      FindOpenSSL.cmake **不认识** OPENSSL_DIR / OPENSSL_LIB_DIR，
+#      它只认 OPENSSL_ROOT_DIR（等价于命令行 -DOPENSSL_ROOT_DIR=...）。
+#      只给 OPENSSL_DIR 时 CMake 一路去 /usr/lib64 找系统 openssl（1.1.1），
+#      若 openssl-devel 没装就连头文件都没有 → "Could NOT find OpenSSL"。
+#
+#   3) OPENSSL_CRYPTO_LIBRARY / OPENSSL_SSL_LIBRARY
+#      FindOpenSSL 的必需变量是 OPENSSL_CRYPTO_LIBRARY 和 OPENSSL_SSL_LIBRARY。
+#      直接给出绝对路径，就不再依赖 CMake 自行推理 lib/lib64 目录名，
+#      彻底规避 "missing: OPENSSL_CRYPTO_LIBRARY" 这类探测失败。
+#
+#      注意：自建 openssl 的库名是 libssl.so.3 / libcrypto.so.3
+#      （OPENSSL_VERSION_NUMBER >= 3 时 .so 只是软链）。
+#      FindOpenSSL 的 find_library 能直接命中 .so.3 后缀，给带 .so.3 的路径最稳。
+#
+#   4) PKG_CONFIG_PATH
+#      FindOpenSSL 会先尝试 pkg-config（openssl.pc），
+#      自建 openssl 的 .pc 落在 ${OPENSSL_PREFIX}/lib64/pkgconfig。
+#
+ENV OPENSSL_DIR=${OPENSSL_PREFIX} \
+    OPENSSL_LIB_DIR=${OPENSSL_PREFIX}/${OPENSSL_LIBDIR} \
+    OPENSSL_INCLUDE_DIR=${OPENSSL_PREFIX}/include \
+    OPENSSL_ROOT_DIR=${OPENSSL_PREFIX} \
+    OPENSSL_CRYPTO_LIBRARY=${OPENSSL_PREFIX}/${OPENSSL_LIBDIR}/libcrypto.so.3 \
+    OPENSSL_SSL_LIBRARY=${OPENSSL_PREFIX}/${OPENSSL_LIBDIR}/libssl.so.3 \
+    PKG_CONFIG_PATH=${OPENSSL_PREFIX}/${OPENSSL_LIBDIR}/pkgconfig \
+    LD_LIBRARY_PATH=${OPENSSL_PREFIX}/${OPENSSL_LIBDIR}
+
+# 自检：确认 4 个关键路径全部存在，且 CMake 真能通过 FindOpenSSL 探测。
+# 把问题提前到这一步暴露，别拖到 400 秒后的 cargo 编译阶段。
+RUN set -eux; \
+    for f in \
+        "${OPENSSL_PREFIX}/include/openssl/ssl.h" \
+        "${OPENSSL_CRYPTO_LIBRARY}" \
+        "${OPENSSL_SSL_LIBRARY}" \
+        "${OPENSSL_PREFIX}/lib64/libssl.so" \
+        "${OPENSSL_PREFIX}/lib64/libcrypto.so" ; do \
+        test -e "$f" || { echo "MISSING: $f"; exit 1; }; \
+    done; \
+    echo "--- openssl 自检通过 ---"; \
+    sed -n '1p' "${OPENSSL_PREFIX}/include/openssl/opensslv.h" || true
 
 # ---- Quickwit 源码 + UI 产物 ----
 COPY quickwit /quickwit
@@ -163,10 +219,24 @@ COPY --from=ui-builder /quickwit/quickwit-ui/build /quickwit/quickwit-ui/build
 WORKDIR /quickwit
 
 # 编译（带 BuildKit 缓存，Actions 上多栈复用更快）
+#
+# 环境变量说明：
+#   RUSTFLAGS       —— quickwit 需要 tokio_unstable
+#   CMAKE_PREFIX_PATH —— 让 CMake 优先在自建 openssl 下找 config 文件
+#                        （FindOpenSSL 的 config 模式命中 OpenSSLConfig.cmake）
+#   OPENSSL_ROOT_DIR 已由上面的 ENV 提供，这里不重复
+#   CC / CXX / AR / RANLIB —— 显式钉住编译器。
+#     上一版日志里 CMake 探测到的是 GNU 8.5.0，即 UOS 自带的 /usr/bin/cc。
+#     vendored 依赖（librdkafka、zstd、zlib）对 gcc 版本敏感，
+#     显式给出绝对路径可避免 PATH 被 rust 工具链插入后 cc 解析到别的版本。
 RUN --mount=type=cache,target=/quickwit/target,sharing=locked \
     set -eux; \
     echo "Building workspace with feature(s) '${CARGO_FEATURES}' and profile '${CARGO_PROFILE}'"; \
+    echo "C compiler: $(cc --version | head -n1)"; \
+    echo "C++ compiler: $(c++ --version | head -n1)"; \
     export RUSTFLAGS="--cfg tokio_unstable"; \
+    export CMAKE_PREFIX_PATH="${OPENSSL_PREFIX}"; \
+    export CC=/usr/bin/cc CXX=/usr/bin/c++ AR=/usr/bin/ar RANLIB=/usr/bin/ranlib; \
     cargo build \
         -p quickwit-cli \
         --features "${CARGO_FEATURES}" \
@@ -179,7 +249,7 @@ RUN --mount=type=cache,target=/quickwit/target,sharing=locked \
 # =============================================================================
 # stage3  最终运行镜像（UOS）
 # =============================================================================
-FROM --platform=$TARGETPLATFORM ${UOS_BASE} AS quickwit
+FROM ${UOS_BASE} AS quickwit
 ARG BASE_IMAGE_TAG
 LABEL org.opencontainers.image.authors="blueapple" \
       org.opencontainers.image.version="1.0" \
