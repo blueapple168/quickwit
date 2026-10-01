@@ -15,11 +15,11 @@ runs:
   steps:
     - run: echo "ASSET_FULL_NAME=quickwit-${{ inputs.version }}-${{ inputs.target }}" >> $GITHUB_ENV
       shell: bash
-    - uses: actions/setup-node@v3
+    - uses: actions/setup-node@v4
       with:
         node-version: 24
         cache: "yarn"
-        cache-dependency-path: quickwit/quickwit-ui/yarn.lock
+        cache-dependency-path: quickwit-ui/yarn.lock
     - run: yarn global add node-gyp
       shell: bash
     - run: make build-ui
@@ -48,10 +48,9 @@ runs:
         QW_COMMIT_DATE: ${{ env.QW_COMMIT_DATE }}
         QW_COMMIT_HASH: ${{ env.QW_COMMIT_HASH }}
         QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
-      working-directory: ./quickwit
     - name: Bundle archive
       run: |
-        make archive BINARY_FILE=quickwit/target/${{ inputs.target }}/release/quickwit \
+        make archive BINARY_FILE=target/${{ inputs.target }}/release/quickwit \
           BINARY_VERSION=${{ inputs.version }} ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
       shell: bash
     - name: Save binary archive for three days
