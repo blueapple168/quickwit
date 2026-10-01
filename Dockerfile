@@ -56,7 +56,7 @@ RUN touch .gitignore_for_build_directory ; \
 
 
 # ------------------------------
-# stage2 bin‑builder：rust编译后端quickwit；链接自建openssl3.5.8
+# stage2 bin‑builder：rust编译后端quickwit；链接自建openssl3.5.9
 # ------------------------------
 FROM --platform=linux/amd64 ${UOS_BASE} AS bin-builder
 ARG CARGO_FEATURES=release-feature-set
@@ -83,7 +83,7 @@ RUN set -eux; \
     cd rust-1.98.0-x86_64-unknown-linux-musl && ./install.sh;
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# 设置openssl环境变量，cargo编译时优先使用自建openssl‑3.5.8
+# 设置openssl环境变量，cargo编译时优先使用自建openssl‑3.5.9
 ENV OPENSSL_DIR=/usr/local/openssl3
 ENV OPENSSL_LIB_DIR=/usr/local/openssl3/lib64
 ENV OPENSSL_INCLUDE_DIR=/usr/local/openssl3/include
