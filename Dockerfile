@@ -42,7 +42,7 @@ ENV NODE_VERSION=v24.21.0
 RUN set -eux; \
     cd /opt ; \
     curl -fsSL https://nodejs.org/download/release/latest-v24.x/node-${NODE_VERSION}-linux-x64.tar.gz -o node-${NODE_VERSION}-linux-x64.tar.gz ; \
-    curl -fsSL https://nodejs.org/download/release/latest-v24.x/SHASUMS256.txt | grep 'node-${NODE_VERSION}-linux-x64.tar.gz' | sha256sum -c ; \
+    curl -fsSL https://nodejs.org/download/release/latest-v24.x/SHASUMS256.txt | grep "node-${NODE_VERSION}-linux-x64.tar.gz" | sha256sum -c ; \
     tar -xzf node-${NODE_VERSION}-linux-x64.tar.gz; \
     mv node-${NODE_VERSION}-linux-x64 nodejs
 
