@@ -71,7 +71,9 @@ ENV QW_COMMIT_TAGS=$QW_COMMIT_TAGS
 # 安装系统编译依赖
 RUN set -eux; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
-    yum install -y tar findutils gzip clang cmake llvm protobuf-compiler ca-certificates;
+    yum install -y tar findutils gzip clang cmake llvm protobuf-compiler ca-certificates; \
+    curl -fsSL https://github.com/Yelp/dumb-init/releases/download/v1.2.5/dumb-init_1.2.5_x86_64 -o /usr/local/bin/dumb-init ; \
+    chmod +x /usr/local/bin/dumb-init
 
 # copy openssl编译产物 from openssl‑builder
 COPY --from=openssl-builder /usr/local/openssl3 /usr/local/openssl3
@@ -135,7 +137,7 @@ RUN mkdir -p config qwdata
 
 COPY --from=bin-builder /quickwit/bin/quickwit /usr/local/bin/quickwit
 COPY --from=bin-builder /quickwit/config/quickwit.yaml /quickwit/config/quickwit.yaml
-COPY dumb-init /usr/local/bin/dumb-init
+COPY --from=bin-builder /usr/local/bin/dumb-init /usr/local/bin/dumb-init
 
 ENV QW_CONFIG=/quickwit/config/quickwit.yaml
 ENV QW_DATA_DIR=/quickwit/qwdata
