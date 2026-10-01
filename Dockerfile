@@ -37,7 +37,6 @@ FROM --platform=linux/amd64 ${UOS_BASE} AS ui-builder
 RUN set -eux; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     yum install -y tar gzip make
-# 离线导入node（构建上下文提供node‑v24.x‑linux‑x64.tar.gz）
 ENV NODE_VERSION=v24.21.0
 RUN set -eux; \
     cd /opt ; \
@@ -48,6 +47,8 @@ RUN set -eux; \
 
 ENV PATH="/opt/nodejs/bin:${PATH}"
 
+# 新增：利用npm全局安装yarn和node‑gyp
+RUN set -eux; npm install -g yarn node-gyp
 COPY quickwit/quickwit-ui /quickwit/quickwit-ui
 WORKDIR /quickwit/quickwit-ui
 RUN touch .gitignore_for_build_directory ; \
@@ -120,7 +121,7 @@ LABEL org.opencontainers.image.authors="baidongying@cnpc.com.cn" \
       org.opencontainers.image.licenses="Apache-2.0" \
       org.opencontainers.image.description="Quickwit(UOS‑Server‑1070a)" \
       os="UOS Linux" \
-      os.version="${OS_VERSION}"
+      os.version="${BASE_IMAGE_TAG}"
 
 RUN set -eux; \
     sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
