@@ -98,7 +98,7 @@ COPY --from=ui-builder /quickwit/quickwit-ui/build /quickwit/quickwit-ui/build
 
 WORKDIR /quickwit
 
-RUN rustup toolchain install
+# RUN rustup toolchain install
 
 RUN echo "Building workspace with feature(s) '$CARGO_FEATURES' and profile '$CARGO_PROFILE'" \
     && RUSTFLAGS="--cfg tokio_unstable" \
