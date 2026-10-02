@@ -5,11 +5,6 @@
 
 ARG BASE_IMAGE_TAG=uos-server-20-1070a:latest
 ARG UOS_BASE=ghcr.io/blueapple168/${BASE_IMAGE_TAG}
-# 目标平台：UOS 基础镜像只提供 linux/amd64。
-# 不再写 FROM --platform=$TARGETPLATFORM —— TARGETPLATFORM 是 BuildKit 预定义 ARG，
-# FROM 默认就取该平台，显式写等于重复，会触发 RedundantTargetPlatform 告警。
-# 同时也不再声明自己的 ARG TARGETPLATFORM（会遮蔽预定义值）。
-# 已知限制：本构建链只支持 amd64；将来若要出 arm64 需重做（UOS 侧无 arm64 基础镜像）。
 
 # 全局构建参数（可被 GitHub Actions 覆盖）
 ARG OPENSSL_VERSION=3.5.9
@@ -114,12 +109,20 @@ SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 #           zlib-devel     -> zlib 的 CMake 探测（FindZLIB 兜底）
 #         以前只装 gcc-c++，靠 vendored zlib/zstd 也能过，但 openssl 没有 devel
 #         就一定找不到。
+#
+# 注意 3：libcurl-devel 必须有。rdkafka-sys 4.10 带的是 librdkafka 2.12，
+#         其 src/rdkafka_conf.c 顶部是无条件 `#include <curl/curl.h>`
+#         （旧版 librdkafka 只在 WITH_CURL 时要），所以哪怕是 -DWITH_CURL=0，
+#         头文件仍然必须存在，否则：
+#             rdkafka_conf.c:60:10: fatal error: curl/curl.h: No such file or directory
+#         上一轮日志里 CMake 的 `-DWITH_CURL=0` 已经明确给出了，仍然挂了，
+#         就是这个原因——WITH_CURL 只控制链接，不控制 include。
 RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
         tar gzip xz unzip curl ca-certificates findutils which \
         clang cmake llvm \
         gcc gcc-c++ make pkgconfig perl \
-        openssl-devel zlib-devel; \
+        openssl-devel zlib-devel libcurl-devel; \
     yum clean all; rm -rf /var/cache/yum/*; \
     curl -fsSL "https://github.com/Yelp/dumb-init/releases/download/v${DUMB_INIT_VERSION}/dumb-init_${DUMB_INIT_VERSION}_x86_64" \
          -o /usr/local/bin/dumb-init; \
@@ -212,6 +215,17 @@ RUN set -eux; \
     echo "--- openssl 自检通过 ---"; \
     sed -n '1p' "${OPENSSL_PREFIX}/include/openssl/opensslv.h" || true
 
+# 自检：librdkafka 编译期必需的头文件/工具，缺了直接在这里报错。
+#   curl/curl.h        librdkafka 2.12 无条件 include（libcurl-devel）
+#   libsasl2 可以没有  —— 走 -DWITH_SASL=0，只有 SCRAM/OAUTHBEARER 内置实现
+#   注意这里刻意不打印 sasl 相关检查，避免误判失败。
+RUN set -eux; \
+    for f in /usr/include/curl/curl.h /usr/include/curl/curlver.h; do \
+        test -e "$f" || { echo "MISSING: $f"; exit 1; }; \
+    done; \
+    echo "--- librdkafka 依赖自检通过 ---"; \
+    curl-config --version || true
+
 # ---- Quickwit 源码 + UI 产物 ----
 COPY quickwit /quickwit
 COPY config/quickwit.yaml /quickwit/config/quickwit.yaml
@@ -261,7 +275,9 @@ SHELL ["/bin/bash", "-euxo", "pipefail", "-c"]
 
 RUN sed -i 's/\$StateMode/ufu/g' /etc/yum.repos.d/UnionTechOS.repo; \
     yum install -y --setopt=install_weak_deps=false --nogpgcheck --nodocs \
-        ca-certificates curl findutils tar gzip; \
+        ca-certificates curl findutils tar gzip \
+        zlib libcurl openssl-libs \
+        libstdc++ libgcc; \
     yum clean all; \
     rm -rf /var/cache/yum/* /var/tmp/* /tmp/*
 
