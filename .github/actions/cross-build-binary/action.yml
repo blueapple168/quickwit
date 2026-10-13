@@ -16,41 +16,31 @@ runs:
     - run: echo "ASSET_FULL_NAME=quickwit-${{ inputs.version }}-${{ inputs.target }}" >> $GITHUB_ENV
       shell: bash
 
-    - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+    - uses: actions/setup-node@v3
       with:
-        node-version: 24
+        node-version: 26
         cache: "yarn"
         cache-dependency-path: quickwit/quickwit-ui/yarn.lock
 
-    - name: Set yarn mirror to npmmirror (fix 502 Bad Gateway)
+    # ========== 仅这一行是fork新增，解决yarn 502 Bad Gateway，官方原版没有 ==========
+    - name: Set yarn npmmirror registry
       run: yarn config set registry https://registry.npmmirror.com
       shell: bash
 
     - run: yarn global add node-gyp
       shell: bash
 
-    - name: Build UI with retry
-      run: |
-        set +e
-        make -C quickwit build-ui
-        ret=$?
-        if [ $ret -ne 0 ]; then
-          yarn cache clean
-          echo "Retry build-ui"
-          make -C quickwit build-ui
-        fi
+    - run: make build-ui
       shell: bash
 
     - name: Install rustup
       shell: bash
       run: curl https://sh.rustup.rs -sSf | sh -s -- --default-toolchain none -y
 
-    - name: Load rust environment
-      run: source "$HOME/.cargo/env"
-      shell: bash
-
     - name: Install cross
-      run: source "$HOME/.cargo/env" && cargo install cross
+      run: |
+        source "$HOME/.cargo/env"
+        cargo install cross
       shell: bash
 
     - name: Retrieve and export commit date, hash, and tags
@@ -66,52 +56,27 @@ runs:
         echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=neoverse-n1 -C link-arg=-lresolv --cfg tokio_unstable" >> "$GITHUB_ENV"
       shell: bash
 
-    # Linux target use cross，manifest-path指向 quickwit子目录的Cargo.toml
-    - name: Build Quickwit Linux (cross)
-      if: contains(inputs.target, '-unknown-linux-gnu')
-      run: |
-        source "$HOME/.cargo/env"
-        cross build --release \
-          --manifest-path ./quickwit/Cargo.toml \
-          --features release-feature-vendored-set \
-          --target ${{ inputs.target }} \
-          --bin quickwit
+    # ===== 官方核心：working-directory: ./quickwit =====
+    - name: Build Quickwit
+      run: cross build --release --features release-feature-vendored-set --target ${{ inputs.target }} --bin quickwit
       shell: bash
+      working-directory: ./quickwit
       env:
         QW_COMMIT_DATE: ${{ env.QW_COMMIT_DATE }}
         QW_COMMIT_HASH: ${{ env.QW_COMMIT_HASH }}
         QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
 
-    # macOS target use native cargo
-    - name: Build Quickwit macOS native cargo
-      if: contains(inputs.target, '-apple-darwin')
-      run: |
-        source "$HOME/.cargo/env"
-        cargo build --release \
-          --manifest-path ./quickwit/Cargo.toml \
-          --features release-feature-vendored-set \
-          --target ${{ inputs.target }} \
-          --bin quickwit
-      shell: bash
-      env:
-        QW_COMMIT_DATE: ${{ env.QW_COMMIT_DATE }}
-        QW_COMMIT_HASH: ${{ env.QW_COMMIT_HASH }}
-        QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
-
-    # 打包：二进制输出在 quickwit/target/${target}/release/quickwit
     - name: Bundle archive
       run: |
-        make -C quickwit archive \
-          BINARY_FILE=target/${{ inputs.target }}/release/quickwit \
-          BINARY_VERSION=${{ inputs.version }} \
-          ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
+        make archive BINARY_FILE=quickwit/target/${{ inputs.target }}/release/quickwit \
+        BINARY_VERSION=${{ inputs.version }} ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
       shell: bash
 
     - name: Save binary archive for three days
       uses: actions/upload-artifact@v4.4.0
       with:
         name: ${{ env.ASSET_FULL_NAME }}.tar.gz
-        path: ./quickwit/${{ env.ASSET_FULL_NAME }}.tar.gz
+        path: ./${{ env.ASSET_FULL_NAME }}.tar.gz
         retention-days: 3
 
     - name: Upload archive
@@ -119,7 +84,7 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
       with:
-        file: ./quickwit/${{ env.ASSET_FULL_NAME }}.tar.gz
+        file: ${{ env.ASSET_FULL_NAME }}.tar.gz
         overwrite: true
         draft: ${{ inputs.version != 'nightly' }}
         tag_name: ${{ inputs.version }}
