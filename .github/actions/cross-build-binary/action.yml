@@ -32,12 +32,12 @@ runs:
     - name: Build UI with retry
       run: |
         set +e
-        make build-ui
+        make -C quickwit build-ui
         ret=$?
         if [ $ret -ne 0 ]; then
           yarn cache clean
           echo "Retry build-ui"
-          make build-ui
+          make -C quickwit build-ui
         fi
       shell: bash
 
@@ -66,41 +66,52 @@ runs:
         echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-C target-cpu=neoverse-n1 -C link-arg=-lresolv --cfg tokio_unstable" >> "$GITHUB_ENV"
       shell: bash
 
-    # Linux target use cross
+    # Linux target use cross，manifest-path指向 quickwit子目录的Cargo.toml
     - name: Build Quickwit Linux (cross)
       if: contains(inputs.target, '-unknown-linux-gnu')
       run: |
         source "$HOME/.cargo/env"
-        cross build --release --manifest-path Cargo.toml --features release-feature-vendored-set --target ${{ inputs.target }} --bin quickwit
+        cross build --release \
+          --manifest-path ./quickwit/Cargo.toml \
+          --features release-feature-vendored-set \
+          --target ${{ inputs.target }} \
+          --bin quickwit
       shell: bash
       env:
         QW_COMMIT_DATE: ${{ env.QW_COMMIT_DATE }}
         QW_COMMIT_HASH: ${{ env.QW_COMMIT_HASH }}
         QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
 
-    # macOS target use native cargo (mac不能跑cross)
+    # macOS target use native cargo
     - name: Build Quickwit macOS native cargo
       if: contains(inputs.target, '-apple-darwin')
       run: |
         source "$HOME/.cargo/env"
-        cargo build --release --manifest-path Cargo.toml --features release-feature-vendored-set --target ${{ inputs.target }} --bin quickwit
+        cargo build --release \
+          --manifest-path ./quickwit/Cargo.toml \
+          --features release-feature-vendored-set \
+          --target ${{ inputs.target }} \
+          --bin quickwit
       shell: bash
       env:
         QW_COMMIT_DATE: ${{ env.QW_COMMIT_DATE }}
         QW_COMMIT_HASH: ${{ env.QW_COMMIT_HASH }}
         QW_COMMIT_TAGS: ${{ env.QW_COMMIT_TAGS }}
 
+    # 打包：二进制输出在 quickwit/target/${target}/release/quickwit
     - name: Bundle archive
       run: |
-        make archive BINARY_FILE=target/${{ inputs.target }}/release/quickwit \
-          BINARY_VERSION=${{ inputs.version }} ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
+        make -C quickwit archive \
+          BINARY_FILE=target/${{ inputs.target }}/release/quickwit \
+          BINARY_VERSION=${{ inputs.version }} \
+          ARCHIVE_NAME=${{ env.ASSET_FULL_NAME }}
       shell: bash
 
     - name: Save binary archive for three days
       uses: actions/upload-artifact@v4.4.0
       with:
         name: ${{ env.ASSET_FULL_NAME }}.tar.gz
-        path: ./${{ env.ASSET_FULL_NAME }}.tar.gz
+        path: ./quickwit/${{ env.ASSET_FULL_NAME }}.tar.gz
         retention-days: 3
 
     - name: Upload archive
@@ -108,7 +119,7 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.token }}
       with:
-        file: ${{ env.ASSET_FULL_NAME }}.tar.gz
+        file: ./quickwit/${{ env.ASSET_FULL_NAME }}.tar.gz
         overwrite: true
         draft: ${{ inputs.version != 'nightly' }}
         tag_name: ${{ inputs.version }}
